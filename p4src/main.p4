@@ -424,6 +424,23 @@ control IngressPipeImpl (inout parsed_headers_t    hdr,
     }
 
 
+
+
+
+    action ndp_ns_to_na(mac_addr_t target_mac) {
+        hdr.ethernet.src_addr = target_mac;
+        hdr.ethernet.dst_addr = IPV6_MCAST_01;
+        ipv6_addr_t host_ipv6_tmp = hdr.ipv6.src_addr;
+        hdr.ipv6.src_addr = hdr.ndp.target_ipv6_addr;
+        hdr.ipv6.dst_addr = host_ipv6_tmp;
+        hdr.ipv6.next_hdr = IP_PROTO_ICMPV6;
+        hdr.icmpv6.type = ICMP6_TYPE_NA;
+        hdr.ndp.flags = NDP_FLAG_ROUTER | NDP_FLAG_OVERRIDE;
+        hdr.ndp.type = NDP_OPT_TARGET_LL_ADDR;
+        hdr.ndp.length = 1;
+        hdr.ndp.target_mac_addr = target_mac;
+        standard_metadata.egress_spec = standard_metadata.ingress_port;
+    }
     // *** TODO EXERCISE 5 (IPV6 ROUTING)
     //
     // 1. Create a table to to handle NDP messages to resolve the MAC address of
@@ -431,17 +448,70 @@ control IngressPipeImpl (inout parsed_headers_t    hdr,
     //    - match on hdr.ndp.target_ipv6_addr (exact match)
     //    - provide action "ndp_ns_to_na" (look in snippets.p4)
     //    - default_action should be "NoAction"
+
+    table ndp_match_MAC_table {
+        key = {
+            hdr.ndp.target_ipv6_addr: exact;
+        }
+        actions = {
+            ndp_ns_to_na;
+        }
+        @name("ndp_match_MAC_table_counter")
+        counters = direct_counter(CounterType.packets_and_bytes);
+    }
     //
     // 2. Create table to handle IPv6 routing. Create a L2 my station table (hit
     //    when Ethernet destination address is the switch address). This table
     //    should not do anything to the packet (i.e., NoAction), but the control
     //    block below should use the result (table.hit) to decide how to process
     //    the packet.
+    table L2_station_table {
+        key = {
+            hdr.ethernet.dst_addr: exact;
+        }
+        actions = {
+            NoAction;
+        }
+        @name("L2_station_table_counter")
+        counters = direct_counter(CounterType.packets_and_bytes);
+
+    }
     //
-    // 3. Create a table for IPv6 routing. An action selector should be use to
+    // 3. Create a table for IPv6 routing. An action selector should be used to
     //    pick a next hop MAC address according to a hash of packet header
     //    fields (IPv6 source/destination address and the flow label). Look in
     //    snippets.p4 for an example of an action selector and table using it.
+
+    action_selector(HashAlgorithm.crc16, 32w1024, 32w16) ecmp_selector;
+
+    action set_next_hop(mac_addr_t dmac) {
+        hdr.ethernet.src_addr = hdr.ethernet.dst_addr;
+        hdr.ethernet.dst_addr = dmac; //dst mac
+        // Decrement TTL
+        hdr.ipv6.hop_limit = hdr.ipv6.hop_limit - 1;
+    }
+
+    table ipv6_routing_table {
+        key = {
+            hdr.ipv6.dst_addr:          lpm;
+            // The following fields are not used for matching, but as input to the
+            // ecmp_selector hash function.
+            hdr.ipv6.dst_addr:          selector;
+            hdr.ipv6.src_addr:          selector;
+            hdr.ipv6.flow_label:        selector;
+            // Following fields are optional per PFC6438
+            hdr.ipv6.next_hdr:          selector;
+            local_metadata.l4_src_port: selector;
+            local_metadata.l4_dst_port: selector;
+        }
+        actions = {
+            set_next_hop;
+        }
+        implementation = ecmp_selector;
+        @name("ipv6_routing_table_counter")
+        counters = direct_counter(CounterType.packets_and_bytes);
+    }
+
     //
     // You can name your tables whatever you like. You will need to fill
     // the name in elsewhere in this exercise.
@@ -451,6 +521,94 @@ control IngressPipeImpl (inout parsed_headers_t    hdr,
     //
     // Implement tables to provide SRV6 logic.
 
+
+
+    // ****************** SRV6_my_sid ******************
+
+    // Process the packet if the destination IP is the segment Id(sid) of this device.
+    // The table will then decrement the "segment left" field from the Srv6 header and set destination IP 
+    // address to the next segment
+
+    action srv6_end() {
+        hdr.srv6h.segment_left = hdr.srv6h.segment_left - 1;
+        hdr.ipv6.dst_addr = local_metadata.next_srv6_sid;
+    }
+
+    direct_counter(CounterType.packets_and_bytes) srv6_my_sid_table_counter;
+    table srv6_my_sid {
+        key = {
+            hdr.ipv6.dst_addr: lpm;
+        }
+        actions = {
+            srv6_end;
+        }
+        counters = srv6_my_sid_table_counter;
+    }
+
+    // SRV6 in transit
+
+    action insert_srv6h_header(bit<8> num_segments) {
+        hdr.srv6h.setValid();
+        hdr.srv6h.next_hdr = hdr.ipv6.next_hdr;
+        hdr.srv6h.hdr_ext_len =  num_segments * 2;
+        hdr.srv6h.routing_type = 4;
+        hdr.srv6h.segment_left = num_segments - 1;
+        hdr.srv6h.last_entry = num_segments - 1;
+        hdr.srv6h.flags = 0;
+        hdr.srv6h.tag = 0;
+        hdr.ipv6.next_hdr = IP_PROTO_SRV6;
+    }
+
+    action srv6_t_insert_2(ipv6_addr_t s1, ipv6_addr_t s2) {
+        hdr.ipv6.dst_addr = s1;
+        hdr.ipv6.payload_len = hdr.ipv6.payload_len + 40;
+        insert_srv6h_header(2);
+        hdr.srv6_list[0].setValid();
+        hdr.srv6_list[0].segment_id = s2;
+        hdr.srv6_list[1].setValid();
+        hdr.srv6_list[1].segment_id = s1;
+    }
+
+    action srv6_t_insert_3(ipv6_addr_t s1, ipv6_addr_t s2, ipv6_addr_t s3) {
+        hdr.ipv6.dst_addr = s1;
+        hdr.ipv6.payload_len = hdr.ipv6.payload_len + 56;
+        insert_srv6h_header(3);
+        hdr.srv6_list[0].setValid();
+        hdr.srv6_list[0].segment_id = s3;
+        hdr.srv6_list[1].setValid();
+        hdr.srv6_list[1].segment_id = s2;
+        hdr.srv6_list[2].setValid();
+        hdr.srv6_list[2].segment_id = s1;
+    }
+
+    direct_counter(CounterType.packets_and_bytes) srv6_transit_table_counter;
+    table srv6_transit {
+        key = {
+            hdr.ipv6.dst_addr: lpm;
+            // also other stuff apparently
+        }
+        actions = {
+            srv6_t_insert_2;
+            srv6_t_insert_3;
+        }
+        counters = srv6_transit_table_counter;
+    }
+
+    //This action is called directly in the apply block
+    action srv6_pop(){
+        hdr.ipv6.next_hdr = hdr.srv6h.next_hdr;
+        // SRv6 header is 8 bytes,
+        // SRv6 list entry is 16 bytes each,
+        // (((bit<16>)hdr.srv6h.last_entry + 1) * 16) + 8;
+        bit<16> srv6h_size = (((bit<16>)hdr.srv6h.last_entry + 1) << 4) + 8;
+        hdr.ipv6.payload_len = hdr.ipv6.payload_len - srv6h_size;
+
+        hdr.srv6h.setInvalid();
+        // Now set MAX_HOPS headers invalid
+        hdr.srv6_list[0].setInvalid();
+        hdr.srv6_list[1].setInvalid();
+        hdr.srv6_list[2].setInvalid();
+    }
 
     // *** ACL
     //
@@ -503,6 +661,9 @@ control IngressPipeImpl (inout parsed_headers_t    hdr,
             // 1. Set the packet egress port to that found in the cpu_out header
             // 2. Remove (set invalid) the cpu_out header
             // 3. Exit the pipeline here (no need to go through other tables
+            standard_metadata.egress_spec = hdr.cpu_out.egress_port;
+            hdr.cpu_out.setInvalid();
+            exit;
         }
 
         bool do_l3_l2 = true;
@@ -514,6 +675,9 @@ control IngressPipeImpl (inout parsed_headers_t    hdr,
             // If this is an NDP NS packet, i.e., if a matching entry is found,
             // unset the "do_l3_l2" flag to skip the L3 and L2 tables, as the
             // "ndp_ns_to_na" action already set an egress port.
+            if (ndp_match_MAC_table.apply().hit){
+                do_l3_l2 = false;
+            }
         }
 
         if (do_l3_l2) {
@@ -523,11 +687,36 @@ control IngressPipeImpl (inout parsed_headers_t    hdr,
             // routing table. You should also add a conditional to drop the
             // packet if the hop_limit reaches 0.
 
+            //if (hdr.ipv6.isValid() && L2_station_table.apply().hit){
+            //    ipv6_routing_table.apply();
+            //    if (hdr.ipv6.hop_limit == 0){
+            //        drop();
+            //    }
+            //}
+
             // *** TODO EXERCISE 6
             // Insert logic to match the SRv6 My SID and Transit tables as well
             // as logic to perform PSP behavior. HINT: This logic belongs
             // somewhere between checking the switch's my station table and
             // applying the routing table.
+
+            if (hdr.ipv6.isValid() && L2_station_table.apply().hit){
+
+                if (srv6_my_sid.apply().hit){
+                    //Penultimate Segment Pop (PSP) logic - enabled for all packets
+                    if (hdr.srv6h.isValid() && hdr.srv6h.segment_left == 0){
+                        srv6_pop();
+                    }
+                } else {
+                    srv6_transit.apply();
+                }
+
+                ipv6_routing_table.apply();
+                // Check TTL, drop packet if at 0
+                if(hdr.ipv6.hop_limit == 0) { drop(); }
+
+            }
+
 
             // L2 bridging logic. Apply the exact table first...
             if (!l2_exact_table.apply().hit) {
@@ -556,6 +745,9 @@ control EgressPipeImpl (inout parsed_headers_t hdr,
             // 1. Set cpu_in header as valid
             // 2. Set the cpu_in.ingress_port field to the original packet's
             //    ingress port (standard_metadata.ingress_port).
+            hdr.cpu_in.setValid();
+            hdr.cpu_in.ingress_port = standard_metadata.ingress_port;
+            exit;
         }
 
         // If this is a multicast packet (flag set by l2_ternary_table), make
