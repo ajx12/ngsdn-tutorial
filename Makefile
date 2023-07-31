@@ -46,6 +46,9 @@ start-v4: _start
 start-gtp: NGSDN_TOPO_PY := topo-gtp.py
 start-gtp: _start
 
+start-test: NGSDN_TOPO_PY := topo-v6-2.py
+start-test: _start
+
 stop:
 	$(info *** Stopping ONOS and Mininet...)
 	@NGSDN_TOPO_PY=foo docker-compose down -t0
@@ -85,6 +88,9 @@ netcfg-sr: _netcfg
 
 netcfg-gtp: NGSDN_NETCFG_JSON := netcfg-gtp.json
 netcfg-gtp: _netcfg
+
+netcfg-test: NGSDN_NETCFG_JSON := netcfg2.json
+netcfg-test: _netcfg
 
 flowrule-gtp:
 	$(info *** Pushing flowrule-gtp.json to ONOS...)
